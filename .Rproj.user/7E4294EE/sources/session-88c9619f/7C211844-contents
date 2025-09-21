@@ -1,0 +1,1510 @@
+---
+title: "Análisis de patrones de mortalidad evitable en la Región San Martín (2010-2023)"
+author: "Grupo # 1"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    collapsed: true
+    smooth_scroll: true
+    theme: journal
+    highlight: kate
+    df_print: paged
+    code_folding: show
+    
+---
+
+# 1.- Base de Datos
+
+```{r message=FALSE, warning=FALSE}
+# Librerías utilizadas en el proyecto
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(forcats)
+library(lubridate)
+library(plotly)
+library(leaflet)
+library(sf)
+library(rnaturalearth)
+library(stringi)
+```
+
+```{r message=FALSE, warning=FALSE, rows.print=20}
+
+# Carga del dataset
+ruta <- "MORTALIDAD.xlsx"
+
+df_raw <- read_excel(ruta)
+df_raw
+
+```
+
+## 1.1 Dimensiones del dataset
+
+```{r}
+# Mostrar dimensiones
+glimpse(df_raw)
+dim(df_raw)
+```
+
+```{r echo=FALSE}
+
+# Cambio de nombre de columna, antes verificamos la existencia de ANIO
+if (!"ANIO" %in% names(df_raw)) {
+  stop("La columna 'ANIO' no existe en la hoja 1 de MORTALIDAD.xlsx.")
+}
+
+# Renombrar ANIO -> AÑO 
+df <- df_raw %>%
+  dplyr::rename(`AÑO` = ANIO)
+
+# Verificación de los nombres de columnas
+names(df)
+```
+
+```{r echo=FALSE}
+
+num_vars <- df %>% select(where(is.numeric)) %>% names()
+cat_vars <- df %>% select(where(is.character)) %>% names()
+
+cat("Cantidad de variables numéricas:", length(num_vars), "\n")
+cat("Nombre de las variables numéricas detectadas:", 
+    ifelse(length(num_vars) > 0, paste(num_vars, collapse = ", "), "— (ninguna)"), "\n\n")
+
+cat("Cantidad de variables categóricas:", length(cat_vars), "\n")
+cat("Nombre de las variables categóricas detectadas:", 
+    ifelse(length(cat_vars) > 0, paste(cat_vars, collapse = ", "), "— (ninguna)"), "\n")
+
+```
+
+
+## 1.2 Análisis de valores nulos y duplicados
+
+```{r echo=FALSE}
+
+# Cantidad de valores nulos por columna
+df %>% summarise_all(~sum(is.na(.)))
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Revisar duplicados
+
+ID <- "IDENTIFICADOR"
+
+if (!ID %in% names(df)) {
+  stop("La columna ",ID," no existe en el dataset.")
+}
+
+# Número total de registros
+n_total <- nrow(df)
+
+# IDs únicos
+n_unicos <- n_distinct(df$ID)
+
+# Cantidad de duplicados
+n_duplicados <- sum(duplicated(df$ID))
+
+cat("Número total de registros:", n_total, "\n")
+cat("Número de IDs únicos:", n_unicos, "\n")
+cat("Número de filas con ID repetido:", n_duplicados, "\n")
+
+# Reporte de valores duplicados
+if (n_duplicados > 0) {
+  cat("\nMuestra IDs repetidos:\n")
+  df %>%
+    group_by(ID) %>%
+    filter(n() > 1) %>%
+    arrange(ID) %>%
+    head(10) %>%
+    print()
+} else {
+  cat("\nNo se encontraron IDs repetidos en la columna",ID,".\n")
+}
+
+```
+
+
+# 2.- Análisis Exploratorio de Datos
+
+## 2.1 Analisis de Variables numéricas
+
+```{r echo=FALSE}
+
+df %>% select(all_of(num_vars)) %>% summary()
+
+
+```
+
+### 2.1.1 Histogramas de Variables numéricas
+
+```{r echo=FALSE}
+
+# Detectar variables numéricas
+num_vars <- df %>% select(where(is.numeric)) %>% names()
+
+# Excluir variables de fecha (si estuvieran en el dataset como numéricas)
+excluir <- c("FECHA_REGISTRO", "FECHA_CORTE")
+num_vars1 <- setdiff(num_vars, excluir)
+
+# Bucle de gráficos
+for (v in num_vars1) {
+  
+  p_hist <- ggplot(df, aes(x = .data[[v]])) +
+    geom_histogram(aes(y = after_stat(count) / sum(after_stat(count))), 
+                   bins = 30, fill = "darkorange", alpha = 0.7, color = "black") +
+    scale_y_continuous(labels = percent) +
+    labs(title = paste("Histograma de", v),
+         x = v,
+         y = "Frecuencia relativa (%)") +
+    theme_minimal()
+  
+  print(p_hist)
+}
+```
+
+
+
+### 2.1.2 Boxplot de Variables numéricas
+
+```{r echo=FALSE}
+df %>%
+  pivot_longer(cols = all_of(num_vars1), names_to = "variable", values_to = "valor") %>%
+  ggplot(aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Boxplots de cada variable numérica") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+
+### 2.1.3 Tratamiento de Outliers
+
+
+```{r}
+# Debido que algunos valores de edad de NIÑOS no esta en años
+# Realizamos una normalización de lasmedades todos en AÑOS
+
+# Validación de datos
+stopifnot(exists("df"))
+if (!"TIEMPO_EDAD" %in% names(df)) stop("La columna 'TIEMPO_EDAD' no existe en df.")
+if (!"EDAD" %in% names(df)) stop("La columna 'EDAD' no existe en df.")
+
+# Normalización de TIEMPO_EDAD (mayúsculas y sin acentos)
+tiempo_std <- df$TIEMPO_EDAD %>%
+  as.character() %>%
+  trimws() %>%
+  toupper() %>%
+  stringi::stri_trans_general("Latin-ASCII")        # "AÑOS" -> "ANOS"; "DÍAS" -> "DIAS"
+
+# Conversion de EDAD/MESES/DIAS a numérico
+edad_num  <- suppressWarnings(as.numeric(df$EDAD))
+meses_num <- if ("MESES" %in% names(df)) suppressWarnings(as.numeric(df$MESES)) else edad_num
+dias_num  <- if ("DIAS"  %in% names(df)) suppressWarnings(as.numeric(df$DIAS))  else edad_num
+
+# Cálculo de la nueva variable EDADR (en años) sin modificar df original
+edadr_cruda <- dplyr::case_when(
+  tiempo_std == "ANOS"                          ~ edad_num,              # AÑOS: se mantiene
+  tiempo_std == "MESES"                         ~ meses_num / 12,        # MESES -> años
+  tiempo_std == "DIAS"                          ~ dias_num  / 365,       # DIAS  -> años
+  tiempo_std %in% c("HORAS","MINUTOS","SEGUNDOS") ~ 0,                   # otras unidades -> 0
+  TRUE                                          ~ NA_real_               # no reconocido
+)
+
+# Redondeo los nuevos valores a 0 decimales
+#edadr_redondeada <- round(edadr_cruda, 0)
+edadr_redondeada <- ifelse(edadr_cruda >= 0.5 & edadr_cruda < 1, 1, round(edadr_cruda, 0))
+
+# Nuevo dataframe df1 con la columna EDADR
+
+df1 <- df %>% mutate(EDADR = edadr_redondeada)
+
+# --------------------------
+# Métricas solicitadas
+# --------------------------
+n_total <- nrow(df1)
+
+# Registros "afectados" (se aplicó conversión: no años)
+n_convertidos <- sum(tiempo_std %in% c("MESES","DIAS","HORAS","MINUTOS","SEGUNDOS"), na.rm = TRUE)
+pct_convertidos <- n_convertidos / n_total
+
+# Comparación EDAD vs EDADR cuando son comparables:
+# - Consideramos comparables solo cuando TIEMPO_EDAD fue "ANOS"
+#   (en otros casos EDAD está en otra unidad, por lo que no es comparable directamente).
+comparables_idx <- which(tiempo_std == "ANOS" & !is.na(edad_num) & !is.na(edadr_redondeada))
+n_comparables   <- length(comparables_idx)
+n_difieren      <- if (n_comparables > 0) sum(round(edad_num[comparables_idx], 0) != edadr_redondeada[comparables_idx]) else 0
+pct_difieren    <- if (n_comparables > 0) n_difieren / n_comparables else NA_real_
+
+# Resumen
+cat("Total de registros: ", n_total, "\n", sep = "")
+cat("Registros convertidos (no 'AÑOS'):", n_convertidos, " (", percent(pct_convertidos, accuracy = 0.1), ")\n", sep = "")
+cat("Registros comparables (TIEMPO_EDAD = 'AÑOS'):", n_comparables, "\n", sep = "")
+cat("De los comparables, EDAD != EDADR (redondeado): ", n_difieren,
+    if (!is.na(pct_difieren)) paste0(" (", percent(pct_difieren, accuracy = 0.1), ")") else "",
+    "\n", sep = "")
+
+# Tabla de distribución de TIEMPO_EDAD (normalizada)
+tabla_tiempo <- tibble(TIEMPO_EDAD_STD = tiempo_std) %>%
+  count(TIEMPO_EDAD_STD, name = "n", sort = TRUE) %>%
+  mutate(pct = percent(n / sum(n)))
+print(tabla_tiempo)
+
+
+```
+
+```{r}
+# Mostrar el DataFrame modificado para poder comparar
+df1
+```
+
+
+```{r}
+
+# Validaciones
+stopifnot(exists("df1"))
+stopifnot(all(c("EDAD","EDADR") %in% names(df1)))
+
+# ========================
+# 1) TABLA RESUMEN (usa solo df1)
+# ========================
+tabla_resumen <- df1 %>%
+  mutate(
+    TIEMPO_EDAD_STD = if ("TIEMPO_EDAD" %in% names(df1)) {
+      .data[["TIEMPO_EDAD"]] %>%
+        as.character() %>% trimws() %>% toupper() %>%
+        stringi::stri_trans_general("Latin-ASCII")
+    } else {
+      NA_character_
+    },
+    cat_edadr = dplyr::case_when(
+      is.na(EDADR) ~ "NA",
+      EDADR == 0   ~ "0",
+      EDADR == 1   ~ "1",
+      EDADR > 1    ~ ">1",
+      TRUE         ~ "Otro"
+    )
+  ) %>%
+  count(TIEMPO_EDAD_STD, cat_edadr, name = "n") %>%
+  group_by(TIEMPO_EDAD_STD) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  ungroup()
+
+print(tabla_resumen, n = nrow(tabla_resumen))
+
+
+```
+
+
+```{r}
+
+# Validación de datos
+stopifnot(exists("df"))
+stopifnot(exists("df1"))
+stopifnot("EDADR" %in% names(df1))
+stopifnot("EDAD"  %in% names(df))
+
+# Crear una copia del dataframe original y actualizar EDAD
+df_clean <- df
+df_clean$EDAD <- df1$EDADR  # sobrescribe EDAD con EDADR
+
+if ("TIEMPO_EDAD" %in% names(df_clean)) {
+  df_clean$TIEMPO_EDAD <- "AÑOS"
+}
+```
+
+```{r}
+
+df_clean
+```
+
+
+
+```{r}
+# Analizando la columna EDAD
+summary(df_clean$EDAD)
+```
+
+```{r}
+
+glimpse(df_clean)
+dim(df_clean)
+```
+
+
+```{r}
+
+
+# 1) Identificar registros con EDAD = NA
+na_rows <- which(is.na(df_clean$EDAD))
+
+cat("Cantidad de registros con EDAD = NA antes del reemplazo:", length(na_rows), "\n")
+
+if (length(na_rows) > 0) {
+  cat("Índices de filas con EDAD = NA:\n")
+  print(na_rows)
+  
+  # Mostrar los primeros registros con NA para revisión
+  print(head(df_clean[na_rows, ], 10))
+  
+  # 2) Reemplazar NA en EDAD con 999
+  df_clean$EDAD[na_rows] <- 999
+  
+  cat("\nSe reemplazaron", length(na_rows), "valores NA por 999 en la columna EDAD.\n")
+} else {
+  cat("No se encontraron valores NA en la columna EDAD.\n")
+}
+
+# 3) Recuento final de valores 999 en EDAD
+n_999 <- sum(df_clean$EDAD == 999, na.rm = TRUE)
+cat("\nCantidad de registros con EDAD = 999 después del reemplazo:", n_999, "\n")
+
+# (Opcional) Mostrar una tabla de frecuencias básica
+tabla_edad <- table(df_clean$EDAD == 999)
+print(tabla_edad)
+```
+
+
+```{r}
+plot(density(df_clean$EDAD))
+#plot(density(df_clean$EDAD[!is.na(df_clean$EDAD)]))
+     
+```
+
+
+```{r}
+# Continuamos con la Base de Datos df
+
+df <- df_clean
+
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, rows.print=17}
+
+# Definir valor máximo de la edad para buscar en el dataset
+edad <- 120
+
+# Verificar existencia de columna EDAD
+if (!"EDAD" %in% names(df)) {
+  stop("La columna 'EDAD' no existe en el dataset.")
+}
+
+# Filtrar outliers
+outliers_edad <- df %>% filter(EDAD > edad)
+
+# Mostrar la cantidad de personas mayores a "edad"
+cat("Número total de personas con EDAD >", edad, ":", nrow(outliers_edad), "\n\n")
+
+# 5) Mostrar listado de todos los outliers de "edad"
+
+head(outliers_edad, nrow(outliers_edad))
+
+```
+```{r echo=FALSE}
+# IMPUTACIÓN DE EDADES
+# Utilizamos una copia numérica de EDAD para los cálculos
+
+df_num <- df %>% mutate(EDAD = suppressWarnings(as.numeric(EDAD)))
+
+# Mediana de niños (ETAPA == "NIÑO"), excluyendo NA y el código 999
+mediana_nino <- df_num %>%
+  filter(ETAPA == "NIÑO", !is.na(EDAD), EDAD != 999) %>%
+  summarise(mediana = median(EDAD, na.rm = TRUE)) %>%
+  pull(mediana)
+
+# Mediana de adultos (ETAPA "ADULTO"), excluyendo NA y 999
+mediana_adulto <- df_num %>%
+  filter(ETAPA == "ADULTO", !is.na(EDAD), EDAD != 999) %>%
+  summarise(mediana = median(EDAD, na.rm = TRUE)) %>%
+  pull(mediana)
+
+# Mediana de adultos (ETAPA "ADULTO MAYOR"), excluyendo NA y 999
+mediana_adulto_mayor <- df_num %>%
+  filter(ETAPA == "ADULTO MAYOR", !is.na(EDAD), EDAD != 999) %>%
+  summarise(mediana = median(EDAD, na.rm = TRUE)) %>%
+  pull(mediana)
+
+cat("Mediana EDAD (NIÑO): ", mediana_nino, "\n")
+cat("Mediana EDAD (ADULTO): ", mediana_adulto, "\n")
+cat("Mediana EDAD (ADULTO MAYOR): ", mediana_adulto_mayor, "\n")
+
+```
+```{r echo=FALSE}
+
+# Conteo previo (cuántos 999 hay por grupo)
+antes_nino   <- sum(df_num$EDAD == 999 & df_num$ETAPA == "NIÑO", na.rm = TRUE)
+antes_adulto <- sum(df_num$EDAD == 999 & df_num$ETAPA == "ADULTO", na.rm = TRUE)
+antes_adulto_mayor <- sum(df_num$EDAD == 999 & df_num$ETAPA == "ADULTO MAYOR", na.rm = TRUE)
+
+
+# Imputación por grupo
+
+df_tmp <- df_num %>%
+  mutate(
+    EDAD = case_when(
+      EDAD == 999 & ETAPA == "NIÑO"          & !is.na(mediana_nino)   ~ mediana_nino,
+      EDAD == 999 & ETAPA == "ADULTO"        & !is.na(mediana_adulto) ~ mediana_adulto,
+      EDAD == 999 & ETAPA == "ADULTO MAYOR"  & !is.na(mediana_adulto_mayor) ~ mediana_adulto_mayor,
+      TRUE ~ EDAD
+      
+    )
+  )
+
+# Conteo posterior para verificar
+despues_nino   <- sum(df_tmp$EDAD == 999 & df_tmp$ETAPA == "NIÑO", na.rm = TRUE)
+despues_adulto <- sum(df_tmp$EDAD == 999 & df_tmp$ETAPA == "ADULTO", na.rm = TRUE)
+despues_adulto_mayor <- sum(df_tmp$EDAD == 999 & df_tmp$ETAPA == "ADULTO MAYOR", na.rm = TRUE)
+
+
+cat("\nResumen de imputaciones (EDAD == 999):\n")
+cat("NIÑO         → antes:", antes_nino,   " / después:", despues_nino,   "\n")
+cat("ADULTO       → antes:", antes_adulto, " / después:", despues_adulto, "\n")
+cat("ADULTO MAYOR → antes:", antes_adulto_mayor, " / después:", despues_adulto_mayor, "\n")
+
+
+```
+```{r}
+
+plot(density(df_tmp$EDAD))
+```
+
+```{r}
+
+df_tmp %>% select(all_of(num_vars)) %>% summary()
+```
+
+
+## 2.2 Analisis de Variables categóricas
+
+```{r echo=FALSE}
+for (v in cat_vars) {
+  cat("Variable:", v, "\n")
+  print(df_tmp %>% count(.data[[v]], sort = TRUE) %>% mutate(pct = round(100*n/sum(n), 2)))
+  cat("\n-----------------------------\n")
+}
+```
+### 2.2.1 Histogramas de Variables Categóricas
+
+```{r echo=FALSE}
+
+# Constante: máximo de categorías a mostrar
+level_max <- 25
+
+# Detectar variables categóricas
+cat_vars <- df_tmp %>%
+  select(where(~ is.character(.) || is.factor(.))) %>%
+  names()
+
+# Excluir columnas no deseadas para graficar
+excluir <- c("IDENTIFICADOR", "DEPARTAMENTO", "LATITUD", "LONGITUD")
+cat_vars1 <- setdiff(cat_vars, excluir)
+
+# Bucle para graficar cada variable categórica (independiente)
+for (v in cat_vars1) {
+  
+  # Tabla completa de frecuencias (excluye NA y vacío)
+  freq_full <- df_tmp %>%
+    filter(!is.na(.data[[v]]), .data[[v]] != "") %>%
+    count(categoria = .data[[v]], name = "n", sort = TRUE)
+  
+  # Si no hay categorías válidas, pasar
+  if (nrow(freq_full) == 0) next
+  
+  total_v <- sum(freq_full$n)
+  
+  # Top N y "OTROS"
+  topN <- freq_full %>% slice_head(n = level_max)
+  if (nrow(freq_full) > level_max) {
+    otros_n <- sum(freq_full$n) - sum(topN$n)
+    freq_plot <- bind_rows(
+      topN,
+      tibble(categoria = "OTROS", n = otros_n)
+    )
+  } else {
+    freq_plot <- topN
+  }
+  
+  # Recalcular porcentaje sobre el total (incluye OTROS si corresponde)
+  freq_plot <- freq_plot %>%
+    mutate(pct = n / total_v)
+  
+  # Gráfico de barras independiente
+  p <- ggplot(freq_plot, aes(x = fct_reorder(categoria, n), y = n)) +
+    geom_col(fill = "seagreen", alpha = 0.85) +
+    geom_text(aes(label = percent(pct)), hjust = -0.1, size = 3) +
+    coord_flip() +
+    expand_limits(y = max(freq_plot$n) * 1.1) +
+    labs(
+      title = paste(" ", v, "(Top", level_max, " + OTROS)"),
+      x = "Categoría", y = "Frecuencia"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.title.y = element_text(margin = margin(r = 10))
+    )
+  
+  print(p)
+}
+
+```
+
+
+# 3.- Análisis Estadístico
+
+
+## 3.1 Mortalidad General
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, rows.print=20}
+
+# Verificación de Datos
+if (!exists("df_tmp")) stop("El data frame 'df_tmp' no está en el entorno.")
+if (!"FECHA_REGISTRO" %in% names(df_tmp)) stop("No existe la columna 'FECHA_REGISTRO' en df_tmp.")
+
+# Convertir YYYYMMDD → Date
+df_tmp <- df_tmp %>%
+  mutate(FECHA_REGISTRO = ymd(as.character(FECHA_REGISTRO)))
+
+# Construir la serie mensual
+serie_mes <- df_tmp %>%
+  filter(!is.na(FECHA_REGISTRO)) %>%
+  mutate(periodo = floor_date(FECHA_REGISTRO, "month")) %>%
+  count(periodo, name = "fallecidos") %>%
+  arrange(periodo)
+
+# Visualización rápida
+head(serie_mes, nrow(serie_mes))
+
+# Graficar: cantidad de fallecidos Vs año-mes
+if (nrow(serie_mes) > 0) {
+  ggplot(serie_mes, aes(x = periodo, y = fallecidos)) +
+    geom_col(fill = "steelblue", alpha = 0.85) +
+    scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m", expand = c(0.01, 0.01)) +
+    labs(
+      title = "Fallecidos por año-mes (FECHA_REGISTRO)",
+      x = "Año-Mes",
+      y = "Fallecidos (conteo de registros)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+} else {
+  cat("No se pudo construir la serie mensual: todas las FECHA_REGISTRO resultaron NA.\n")
+}
+
+```
+
+
+```{r echo=FALSE}
+
+# Conversión: YYYYMMDD -> Date (sin alterar df_tmp original) 
+if (!exists("df_tmp")) stop("El data frame 'df_tmp' no está en el entorno.")
+if (!"FECHA_REGISTRO" %in% names(df_tmp)) stop("No existe la columna 'FECHA_REGISTRO' en df_tmp.")
+
+fechas <- suppressWarnings(ymd(as.character(df_tmp$FECHA_REGISTRO)))
+
+# Diagnóstico rápido
+cat("Registros totales:", nrow(df_tmp), "\n")
+cat("Registros con FECHA_REGISTRO válida:", sum(!is.na(fechas)), "\n\n")
+
+# Agregado Año–Mes (completando combinaciones ausentes con 0)
+serie_mes <- tibble(fecha = fechas) %>%
+  filter(!is.na(fecha)) %>%
+  transmute(anio = year(fecha),
+            mes_num = month(fecha),
+            mes = month(fecha, label = TRUE, abbr = TRUE)) %>%
+  count(anio, mes_num, mes, name = "fallecidos")
+
+if (nrow(serie_mes) > 0) {
+  anios <- sort(unique(serie_mes$anio))
+  todos <- expand_grid(anio = anios, mes_num = 1:12) %>%
+    mutate(mes = month(mes_num, label = TRUE, abbr = TRUE))
+  
+  serie_mes <- todos %>%
+    left_join(serie_mes, by = c("anio","mes_num","mes")) %>%
+    mutate(fallecidos = replace_na(fallecidos, 0)) %>%
+    arrange(anio, mes_num)
+}
+
+# Ocultar, solo es para verificación de valores
+#print(serie_mes, n = nrow(serie_mes))
+
+# Heatmap Año vs Mes (INTERACTIVO) 
+if (nrow(serie_mes) > 0) {
+  p <- ggplot(serie_mes, aes(
+        x = mes, y = factor(anio), fill = fallecidos,
+        text = paste0("Año: ", anio,
+                      "<br>Mes: ", mes,
+                      "<br>Fallecidos: ", fallecidos)
+      )) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    scale_fill_gradient(low = "lightyellow", high = "red", name = "Fallecidos") +
+    labs(
+      title = "Fallecidos por Año–Mes (FECHA_REGISTRO)",
+      x = "Mes", y = "Año"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      axis.text.x = element_text(angle = 0, vjust = 0.5),
+      panel.grid = element_blank()
+    )
+  
+  # Convertir a interactivo con tooltips personalizados
+  ggplotly(p, tooltip = "text")
+  
+} else {
+  cat("No hay datos válidos para construir el heatmap.\n")
+}
+
+```
+
+
+## 3.2 Causas de Mortalidad
+
+```{r echo=FALSE}
+# Graficar la mortalidad debido a la causa
+stopifnot(exists("df_tmp"))
+n_registros <- nrow(df_tmp)
+cat("Total de registros (fallecidos):", n_registros, "\n")
+
+# Top 20 causas si existe la columna DEBIDO_CAUSA
+if ("DEBIDO_CAUSA" %in% names(df_tmp)) {
+  top_causa <- df_tmp %>%
+    filter(!is.na(DEBIDO_CAUSA), DEBIDO_CAUSA != "") %>%
+    count(DEBIDO_CAUSA, name = "fallecidos", sort = TRUE) %>%
+    slice_head(n = 20)
+
+  # Tabla preliminar
+  print(top_causa)
+
+  # Gráfico interactivo
+  p <- ggplot(top_causa,
+              aes(x = fct_reorder(DEBIDO_CAUSA, fallecidos),
+                  y = fallecidos,
+                  text = paste0("Causa: ", DEBIDO_CAUSA,
+                                "<br>Fallecidos: ", comma(fallecidos)))) +
+    geom_col(fill = "steelblue") +
+    coord_flip() +
+    labs(title = "Top 20 causas de fallecimiento",
+         x = "Causa", y = "N° de fallecidos") +
+    theme_minimal()
+
+  ggplotly(p, tooltip = "text") %>%
+    layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+  
+} else {
+  cat("No existe la columna DEBIDO_CAUSA en el dataset.\n")
+}
+
+```
+
+
+```{r echo=FALSE}
+# Graficar SEXO x DEBIDO_CAUSA
+# Definir un valor de nivel máximo, ya que las causas son demasiadas
+level_max <- 20   # máximo de causas a mostrar; el resto va a "OTROS"
+
+# Verificación de datos
+if (!all(c("SEXO","DEBIDO_CAUSA") %in% names(df_tmp))) {
+  stop("Faltan columnas requeridas: 'SEXO' y/o 'DEBIDO_CAUSA' en df_tmp.")
+}
+
+# Usamos una Tabla base, pero sin modificar df_tmp
+base_tbl <- df_tmp %>%
+  filter(!is.na(SEXO), SEXO != "",
+         !is.na(DEBIDO_CAUSA), DEBIDO_CAUSA != "") %>%
+  mutate(SEXO = as.factor(SEXO),
+         DEBIDO_CAUSA = as.character(DEBIDO_CAUSA))
+
+# Top-N causas por frecuencia global
+top_causas <- base_tbl %>%
+  count(DEBIDO_CAUSA, name = "n", sort = TRUE) %>%
+  slice_head(n = level_max) %>%
+  pull(DEBIDO_CAUSA)
+
+# Reetiquetar causas no Top-N como "OTROS"
+base_tbl <- base_tbl %>%
+  mutate(DEBIDO_CAUSA_TOP = if_else(DEBIDO_CAUSA %in% top_causas, DEBIDO_CAUSA, "OTROS"))
+
+# Tabla cruzada SEXO × DEBIDO_CAUSA_TOP 
+tabla_sc <- base_tbl %>%
+  count(SEXO, DEBIDO_CAUSA_TOP, name = "fallecidos") %>%
+  group_by(DEBIDO_CAUSA_TOP) %>%
+  mutate(pct_en_causa = fallecidos / sum(fallecidos)) %>%   # % dentro de cada causa
+  ungroup()
+
+# Mostrar tabla completa
+print(tabla_sc, n = nrow(tabla_sc))
+
+# --- HEATMAP interactivo: SEXO × DEBIDO_CAUSA_TOP ---
+p_heat <- ggplot(
+  tabla_sc,
+  aes(x = SEXO,
+      y = fct_reorder(DEBIDO_CAUSA_TOP, fallecidos, .fun = sum),
+      fill = fallecidos,
+      text = paste0("Causa: ", DEBIDO_CAUSA_TOP,
+                    "<br>Sexo: ", SEXO,
+                    "<br>Fallecidos: ", comma(fallecidos),
+                    "<br>% dentro de la causa: ", percent(pct_en_causa, accuracy = 0.1)))
+) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient(low = "lightyellow", high = "red", name = "Fallecidos") +
+  labs(title = paste0("SEXO × DEBIDO_CAUSA (Top ", level_max, " + OTROS)"),
+       x = "SEXO", y = "DEBIDO_CAUSA") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+ggplotly(p_heat, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor="black", font=list(color="white")))
+
+# --- BARRAS APILADAS interactivas (ordenadas por total de causa) ---
+tabla_stack <- tabla_sc %>%
+  group_by(DEBIDO_CAUSA_TOP) %>%
+  mutate(total_causa = sum(fallecidos)) %>%
+  ungroup()
+
+p_stack <- ggplot(
+  tabla_stack,
+  aes(x = fct_reorder(DEBIDO_CAUSA_TOP, total_causa),
+      y = fallecidos,
+      fill = SEXO,
+      text = paste0("Causa: ", DEBIDO_CAUSA_TOP,
+                    "<br>Sexo: ", SEXO,
+                    "<br>Fallecidos: ", comma(fallecidos),
+                    "<br>Total causa: ", comma(total_causa),
+                    "<br>% dentro de la causa: ", percent(pct_en_causa, accuracy = 0.1)))
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = paste0("SEXO × DEBIDO_CAUSA (Top ", level_max, " + OTROS)"),
+       x = "DEBIDO_CAUSA", y = "N° de fallecidos", fill = "SEXO") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+ggplotly(p_stack, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor="black", font=list(color="white")))
+
+
+```
+
+## 3.3 Mortalidad por etapa
+
+```{r echo=FALSE}
+
+# Validación de datos
+stopifnot(exists("df_tmp"))
+if (!"ETAPA" %in% names(df_tmp)) stop("No existe la columna 'ETAPA' en df_tmp.")
+
+# Tabla de mortalidad por ETAPA
+tabla_etapa <- df_tmp %>%
+  filter(!is.na(ETAPA), ETAPA != "") %>%
+  count(ETAPA, name = "fallecidos", sort = TRUE) %>%
+  mutate(pct = fallecidos / sum(fallecidos))
+
+# Mostrar tabla completa
+print(tabla_etapa, n = nrow(tabla_etapa))
+
+# Gráfico de barras (ordenado) + tooltip
+p <- ggplot(
+  tabla_etapa,
+  aes(x = fct_reorder(ETAPA, fallecidos), y = fallecidos,
+      text = paste0(
+        "ETAPA: ", ETAPA,
+        "<br>Fallecidos: ", comma(fallecidos),
+        "<br>% del total: ", percent(pct, accuracy = 0.1)
+      ))
+) +
+  geom_col(fill = "#4C78A8") +
+  coord_flip() +
+  labs(title = "Mortalidad total por ETAPA",
+       x = "ETAPA", y = "N° de fallecidos") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9))
+
+# Interactividad y estilo del tooltip
+ggplotly(p, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+```
+
+
+```{r echo=FALSE}
+
+# Sexo por etapa de vida.
+
+# Validación de datos
+stopifnot(exists("df_tmp"))
+if (!all(c("ETAPA","SEXO") %in% names(df_tmp))) stop("Faltan columnas 'ETAPA' y/o 'SEXO' en df_tmp.")
+
+# Base limpia (sin NA/""), con normalización ligera de SEXO (opcional)
+base_tbl <- df_tmp %>%
+  filter(!is.na(ETAPA), ETAPA != "", !is.na(SEXO), SEXO != "") %>%
+  mutate(
+    SEXO = case_when(
+      toupper(SEXO) %in% c("M", "MASCULINO") ~ "MASCULINO",
+      toupper(SEXO) %in% c("F", "FEMENINO")  ~ "FEMENINO",
+      TRUE ~ as.character(SEXO)
+    )
+  )
+
+# Tabla: ETAPA x SEXO, con totales y % dentro de ETAPA
+tabla_es <- base_tbl %>%
+  count(ETAPA, SEXO, name = "fallecidos") %>%
+  group_by(ETAPA) %>%
+  mutate(
+    total_etapa   = sum(fallecidos),
+    pct_en_etapa  = fallecidos / total_etapa
+  ) %>%
+  ungroup()
+
+# Mostrar tabla completa
+print(tabla_es, n = nrow(tabla_es))
+
+# Gráfico de barras apiladas (ordenado por total de ETAPA)
+p <- ggplot(
+  tabla_es,
+  aes(
+    x = fct_reorder(ETAPA, total_etapa),
+    y = fallecidos,
+    fill = SEXO,
+    text = paste0(
+      "ETAPA: ", ETAPA,
+      "<br>Sexo: ", SEXO,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>Total ETAPA: ", comma(total_etapa),
+      "<br>% dentro de ETAPA: ", percent(pct_en_etapa, accuracy = 0.1)
+    )
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Fallecidos por ETAPA y SEXO",
+    x = "ETAPA", y = "N° de fallecidos", fill = "SEXO"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9))
+
+# Interactividad + tooltip negro/blanco
+ggplotly(p, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+
+```
+
+
+## 3.4 Relación Edad Vs Sexo
+
+```{r echo=FALSE}
+
+if (all(c("SEXO","EDAD") %in% names(df_tmp))) {
+  ggplot(df_tmp, aes(x = as.factor(SEXO), y = as.numeric(EDAD), fill = as.factor(SEXO))) +
+    geom_boxplot(alpha = 0.7, color = "black") +
+    labs(title = "Boxplot EDAD por SEXO", x = "SEXO", y = "EDAD") +
+    scale_fill_manual(values = c("MASCULINO" = "skyblue", "FEMENINO" = "lightpink")) +
+    theme_minimal()
+}
+```
+
+```{r echo=FALSE}
+
+if (all(c("SEXO","EDAD") %in% names(df_tmp))) {
+
+  # Normalizar etiquetas de sexo y asegurar EDAD numérica
+  df_plot <- df_tmp %>%
+    mutate(
+      sexo_norm = case_when(
+        toupper(SEXO) %in% c("M", "MASCULINO") ~ "MASCULINO",
+        toupper(SEXO) %in% c("F", "FEMENINO")  ~ "FEMENINO",
+        TRUE ~ NA_character_
+      ),
+      EDAD_num = suppressWarnings(as.numeric(EDAD))
+    ) %>%
+    filter(!is.na(sexo_norm), !is.na(EDAD_num))
+
+  # Si no quedan datos válidos, informar
+  if (nrow(df_plot) == 0) {
+    stop("No hay datos válidos para graficar: verifica valores de SEXO y EDAD.")
+  }
+
+  # ggplot con colores manuales y tooltip personalizado
+  p <- ggplot(df_plot,
+              aes(x = sexo_norm, y = EDAD_num,
+                  fill = sexo_norm,
+                  text = paste0("Sexo: ", sexo_norm,
+                                "<br>Edad: ", EDAD_num))) +
+    geom_boxplot(alpha = 0.7, color = "black") +
+    scale_fill_manual(values = c("MASCULINO" = "skyblue",
+                                 "FEMENINO"  = "lightpink")) +
+    labs(title = "Boxplot EDAD por SEXO",
+         x = "SEXO", y = "EDAD", fill = "SEXO") +
+    theme_minimal()
+
+  # Hacerlo interactivo
+  ggplotly(p, tooltip = "text")
+}
+
+```
+## 3.5 Relación Provincia Vs Sexo
+
+```{r echo=FALSE}
+# BARRAS APILADAS
+
+# Validación de datos
+if (all(c("SEXO","PROVINCIA") %in% names(df_tmp))) {
+  
+  # Tabla cruzada con porcentaje dentro de la provincia
+  tabla_sp <- df_tmp %>%
+    filter(!is.na(SEXO), !is.na(PROVINCIA)) %>%
+    count(PROVINCIA, SEXO, name = "fallecidos") %>%
+    group_by(PROVINCIA) %>%
+    mutate(pct = fallecidos / sum(fallecidos)) %>%
+    ungroup()
+  
+  # ggplot con estética y tooltip personalizados
+  p <- ggplot(
+      tabla_sp,
+      aes(
+        x = SEXO,
+        y = fct_reorder(PROVINCIA, fallecidos, .fun = sum),  # orden por total provincial
+        fill = fallecidos,
+        text = paste0(
+          "Provincia: ", PROVINCIA,
+          "<br>Sexo: ", SEXO,
+          "<br>Fallecidos: ", comma(fallecidos),
+          "<br>% en provincia: ", percent(pct, accuracy = 0.1)
+        )
+      )
+    ) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    scale_fill_gradient(low = "lightyellow", high = "red", name = "Fallecidos") +
+    labs(
+      title = "Fallecidos por SEXO y PROVINCIA",
+      x = "SEXO", y = "PROVINCIA"
+    ) +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8),
+          plot.title = element_text(face = "bold"))
+  
+  # Interactivo con plotly (usa el tooltip definido en aes(text=...))
+  ggplotly(p, tooltip = "text")
+  
+} else {
+  cat("El dataset no contiene las columnas SEXO y PROVINCIA.\n")
+}
+
+```
+
+
+```{r echo=FALSE}
+# BARRA HORIZONTAL
+
+if (all(c("SEXO","PROVINCIA") %in% names(df_tmp))) {
+
+  tabla_sp <- df_tmp %>%
+    filter(!is.na(SEXO), !is.na(PROVINCIA)) %>%
+    count(PROVINCIA, SEXO, name = "fallecidos") %>%
+    group_by(PROVINCIA) %>%
+    mutate(pct = fallecidos / sum(fallecidos),
+           total_prov = sum(fallecidos)) %>%
+    ungroup()
+
+  p_bar <- ggplot(
+      tabla_sp,
+      aes(
+        x = fct_reorder(PROVINCIA, total_prov),
+        y = fallecidos,
+        fill = SEXO,
+        text = paste0(
+          "Provincia: ", PROVINCIA,
+          "<br>Sexo: ", SEXO,
+          "<br>Fallecidos: ", comma(fallecidos),
+          "<br>Total provincia: ", comma(total_prov),
+          "<br>% en provincia: ", percent(pct, accuracy = 0.1)
+        )
+      )
+    ) +
+    geom_col() +
+    coord_flip() +
+    scale_y_continuous(labels = comma) +
+    labs(
+      title = "Fallecidos por SEXO y PROVINCIA",
+      x = "PROVINCIA", y = "N° de fallecidos", fill = "SEXO"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 8)
+    )
+
+  # Convertir a interactivo y personalizar tooltip
+  ggplotly(p_bar, tooltip = "text") %>%
+    layout(
+      hoverlabel = list(
+        bgcolor = "black",   # fondo negro
+        font = list(color = "white")  # texto blanco
+      )
+    )
+}
+
+```
+
+## 3.6 Mortalidad por Tipo_Lugar
+
+```{r echo=FALSE}
+
+# Parámetro opcional: limitar a Top-N TIPO_LUGAR (pon NA para mostrar todos)
+level_max <- 7
+
+# Validación
+stopifnot(exists("df_tmp"))
+if (!"TIPO_LUGAR" %in% names(df_tmp)) stop("No existe la columna 'TIPO_LUGAR' en df_tmp.")
+
+# Tabla de fallecidos por TIPO_LUGAR
+tbl_tl <- df_tmp %>%
+  filter(!is.na(TIPO_LUGAR), TIPO_LUGAR != "") %>%
+  count(TIPO_LUGAR, name = "fallecidos", sort = TRUE) %>%
+  mutate(pct = fallecidos / sum(fallecidos))
+
+# (Opcional) Top-N para legibilidad
+if (!is.na(level_max)) {
+  otros <- tbl_tl %>% slice((level_max+1):n())
+  tbl_tl <- tbl_tl %>% slice_head(n = level_max)
+  if (nrow(otros) > 0) {
+    tbl_tl <- bind_rows(
+      tbl_tl,
+      tibble(TIPO_LUGAR = "OTROS",
+             fallecidos = sum(otros$fallecidos),
+             pct = sum(otros$pct))
+    )
+  }
+}
+
+# Gráfico de barras (horizontal, ordenado)
+p_tl <- ggplot(
+  tbl_tl,
+  aes(
+    x = fct_reorder(TIPO_LUGAR, fallecidos),
+    y = fallecidos,
+    text = paste0(
+      "Tipo de lugar: ", TIPO_LUGAR,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>% del total: ", percent(pct, accuracy = 0.1)
+    )
+  )
+) +
+  geom_col(fill = "#4C78A8") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Fallecidos por TIPO_LUGAR",
+    x = "TIPO_LUGAR", y = "N° de fallecidos"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 8))
+
+ggplotly(p_tl, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+
+```
+
+```{r echo=FALSE}
+
+# Parámetro opcional: Top-N tipos de lugar
+
+level_max <- 7
+
+# Validación
+if (!all(c("SEXO","TIPO_LUGAR") %in% names(df_tmp))) {
+  stop("Faltan columnas: 'SEXO' y/o 'TIPO_LUGAR' en df_tmp.")
+}
+
+# Base limpia
+base_tbl <- df_tmp %>%
+  filter(!is.na(SEXO), SEXO != "", !is.na(TIPO_LUGAR), TIPO_LUGAR != "")
+
+# Top-N TIPO_LUGAR por total
+top_tl <- base_tbl %>%
+  count(TIPO_LUGAR, name = "n", sort = TRUE) %>%
+  slice_head(n = level_max) %>%
+  pull(TIPO_LUGAR)
+
+base_tbl <- base_tbl %>%
+  mutate(TIPO_LUGAR_TOP = if_else(TIPO_LUGAR %in% top_tl, TIPO_LUGAR, "OTROS"))
+
+# Tabla cruzada SEXO × TIPO_LUGAR_TOP
+tabla_st <- base_tbl %>%
+  count(TIPO_LUGAR_TOP, SEXO, name = "fallecidos") %>%
+  group_by(TIPO_LUGAR_TOP) %>%
+  mutate(pct_en_tipo = fallecidos / sum(fallecidos),
+         total_tipo   = sum(fallecidos)) %>%
+  ungroup()
+
+# HEATMAP 
+p_heat <- ggplot(
+  tabla_st,
+  aes(
+    x = SEXO,
+    y = fct_reorder(TIPO_LUGAR_TOP, total_tipo),   # ordenar por total del tipo
+    fill = fallecidos,
+    text = paste0(
+      "Tipo de lugar: ", TIPO_LUGAR_TOP,
+      "<br>Sexo: ", SEXO,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>% dentro del tipo: ", percent(pct_en_tipo, accuracy = 0.1)
+    )
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient(low = "lightyellow", high = "red", name = "Fallecidos") +
+  labs(
+    title = paste0("Fallecidos por SEXO y TIPO_LUGAR (Top ", level_max, " + OTROS)"),
+    x = "SEXO", y = "TIPO_LUGAR"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+ggplotly(p_heat, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+# BARRAS APILADAS
+p_bar <- ggplot(
+  tabla_st,
+  aes(
+    x = fct_reorder(TIPO_LUGAR_TOP, total_tipo),
+    y = fallecidos,
+    fill = SEXO,
+    text = paste0(
+      "Tipo de lugar: ", TIPO_LUGAR_TOP,
+      "<br>Sexo: ", SEXO,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>Total tipo: ", comma(total_tipo),
+      "<br>% dentro del tipo: ", percent(pct_en_tipo, accuracy = 0.1)
+    )
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = paste0("Fallecidos por SEXO y TIPO_LUGAR (Top ", level_max, " + OTROS)"),
+    x = "TIPO_LUGAR", y = "N° de fallecidos", fill = "SEXO"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7))
+
+ggplotly(p_bar, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+```
+
+## 3.7 Mortalidad con Necropsia
+
+```{r echo=FALSE}
+
+level_max <- 4  # máximo de niveles a mostrar
+
+stopifnot(exists("df_tmp"))
+if (!"NECROPSIA" %in% names(df_tmp)) stop("No existe la columna 'NECROPSIA' en df_tmp.")
+
+# Conteo y % por NECROPSIA
+tbl_nec <- df_tmp %>%
+  filter(!is.na(NECROPSIA), NECROPSIA != "") %>%
+  count(NECROPSIA, name = "fallecidos", sort = TRUE) %>%
+  mutate(pct = fallecidos / sum(fallecidos))
+
+# Top-N + OTROS
+top_niv <- tbl_nec %>% slice_head(n = level_max) %>% pull(NECROPSIA)
+tbl_nec_top <- tbl_nec %>% filter(NECROPSIA %in% top_niv)
+tbl_nec_otros <- tbl_nec %>% filter(!NECROPSIA %in% top_niv)
+
+tbl_plot <- bind_rows(
+  tbl_nec_top,
+  tibble(
+    NECROPSIA = if (nrow(tbl_nec_otros) > 0) "OTROS" else character(0),
+    fallecidos = if (nrow(tbl_nec_otros) > 0) sum(tbl_nec_otros$fallecidos) else integer(0),
+    pct = if (nrow(tbl_nec_otros) > 0) sum(tbl_nec_otros$pct) else numeric(0)
+  )
+) %>% filter(!is.na(NECROPSIA) & NECROPSIA != "")
+
+# Barras horizontales
+p_nec <- ggplot(
+  tbl_plot,
+  aes(
+    x = fct_reorder(NECROPSIA, fallecidos),
+    y = fallecidos,
+    text = paste0(
+      "Necropsia: ", NECROPSIA,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>% del total: ", percent(pct, accuracy = 0.1)
+    )
+  )
+) +
+  geom_col(fill = "#4C78A8") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Fallecidos con NECROPSIA",
+       x = "NECROPSIA", y = "N° de fallecidos") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 9))
+
+ggplotly(p_nec, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+
+```
+
+```{r echo=FALSE}
+
+level_max <- 4  # máximo de niveles de NECROPSIA; resto a "OTROS"
+
+if (!all(c("SEXO","NECROPSIA") %in% names(df_tmp))) {
+  stop("Faltan columnas: 'SEXO' y/o 'NECROPSIA' en df_tmp.")
+}
+
+# Base limpia
+base_tbl <- df_tmp %>%
+  filter(!is.na(SEXO), SEXO != "", !is.na(NECROPSIA), NECROPSIA != "")
+
+# Top-N niveles de NECROPSIA por total
+top_nec <- base_tbl %>%
+  count(NECROPSIA, name = "n", sort = TRUE) %>%
+  slice_head(n = level_max) %>%
+  pull(NECROPSIA)
+
+base_tbl <- base_tbl %>%
+  mutate(NECROPSIA_TOP = if_else(NECROPSIA %in% top_nec, NECROPSIA, "OTROS"))
+
+# Tabla cruzada SEXO × NECROPSIA_TOP
+tabla_sn <- base_tbl %>%
+  count(NECROPSIA_TOP, SEXO, name = "fallecidos") %>%
+  group_by(NECROPSIA_TOP) %>%
+  mutate(
+    total_nec = sum(fallecidos),
+    pct_en_nec = fallecidos / total_nec
+  ) %>%
+  ungroup()
+
+# HEATMAP
+p_heat <- ggplot(
+  tabla_sn,
+  aes(
+    x = SEXO,
+    y = fct_reorder(NECROPSIA_TOP, total_nec),  # ordenar por total dentro de NECROPSIA_TOP
+    fill = fallecidos,
+    text = paste0(
+      "Necropsia: ", NECROPSIA_TOP,
+      "<br>Sexo: ", SEXO,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>% dentro de Necropsia: ", percent(pct_en_nec, accuracy = 0.1)
+    )
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradient(low = "lightyellow", high = "red", name = "Fallecidos") +
+  labs(title = "SEXO × NECROPSIA",
+       x = "SEXO", y = "NECROPSIA") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 8))
+
+ggplotly(p_heat, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+# BARRAS APILADAS
+p_bar <- ggplot(
+  tabla_sn,
+  aes(
+    x = fct_reorder(NECROPSIA_TOP, total_nec),
+    y = fallecidos,
+    fill = SEXO,
+    text = paste0(
+      "Necropsia: ", NECROPSIA_TOP,
+      "<br>Sexo: ", SEXO,
+      "<br>Fallecidos: ", comma(fallecidos),
+      "<br>Total Necropsia: ", comma(total_nec),
+      "<br>% dentro de Necropsia: ", percent(pct_en_nec, accuracy = 0.1)
+    )
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "SEXO × NECROPSIA",
+       x = "NECROPSIA", y = "N° de fallecidos", fill = "SEXO") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 8))
+
+ggplotly(p_bar, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "black", font = list(color = "white")))
+
+```
+
+
+# 4.- Mapa de ubicación
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# Dibuja mapa de ubicación
+suppressWarnings({has_ne <- requireNamespace("rnaturalearth", quietly = TRUE)})
+
+# =========================
+# Parámetros
+# =========================
+TOP_N        <- 10
+RADIUS_MIN   <- 6
+RADIUS_MAX   <- 18
+COLOR_LOW    <- "yellow"
+COLOR_HIGH   <- "red"
+POPUP_DEC    <- 1
+
+# =========================
+# 1) Filtrar dataset San Martín
+# =========================
+stopifnot(exists("df_tmp"))
+stopifnot("PROVINCIA" %in% names(df_tmp))
+
+df_sm <- df_tmp
+if ("DEPARTAMENTO" %in% names(df_tmp)) {
+  df_sm <- df_tmp %>%
+    mutate(dep_std = toupper(trimws(DEPARTAMENTO))) %>%
+    filter(dep_std == "SAN MARTIN")
+}
+
+prov_stats_all <- df_sm %>%
+  filter(!is.na(PROVINCIA), PROVINCIA != "") %>%
+  count(PROVINCIA, name = "fallecidos", sort = TRUE)
+
+total_sm <- sum(prov_stats_all$fallecidos)
+prov_stats_all <- prov_stats_all %>%
+  mutate(pct = 100 * fallecidos / total_sm)
+
+prov_stats_top <- dplyr::slice_max(prov_stats_all, order_by = fallecidos, n = TOP_N)
+
+# =========================
+# 2) Coordenadas de capitales provinciales
+# =========================
+coord_tbl <- tibble::tribble(
+  ~PROVINCIA,          ~LAT,     ~LON,
+  "SAN MARTIN",        -6.485,   -76.373,
+  "MOYOBAMBA",         -6.034,   -76.972,
+  "RIOJA",             -6.058,   -77.166,
+  "LAMAS",             -6.425,   -76.512,
+  "TOCACHE",           -8.186,   -76.513,
+  "MARISCAL CACERES",  -7.177,   -76.727,
+  "BELLAVISTA",        -7.064,   -76.591,
+  "PICOTA",            -6.920,   -76.336,
+  "HUALLAGA",          -6.931,   -76.771,
+  "EL DORADO",         -6.614,   -76.691
+)
+
+prov_map_all <- prov_stats_all %>%
+  inner_join(coord_tbl, by = "PROVINCIA") %>%
+  mutate(
+    radius  = scales::rescale(fallecidos, to = c(RADIUS_MIN, RADIUS_MAX)),
+    etiqueta = paste0(
+      "<b>Provincia:</b> ", PROVINCIA, "<br>",
+      "<b>Fallecidos:</b> ", comma(fallecidos), "<br>",
+      "<b>% en San Martín:</b> ", round(pct, POPUP_DEC), "%"
+    )
+  )
+
+prov_map_top <- prov_stats_top %>%
+  inner_join(coord_tbl, by = "PROVINCIA") %>%
+  mutate(
+    radius  = scales::rescale(fallecidos, to = c(RADIUS_MIN + 2, RADIUS_MAX + 4)),
+    etiqueta = paste0(
+      "<b>Provincia:</b> ", PROVINCIA, "<br>",
+      "<b>Fallecidos:</b> ", comma(fallecidos), "<br>",
+      "<b>% en San Martín:</b> ", round(pct, POPUP_DEC), "%"
+    )
+  )
+
+# Paleta amarillo → rojo
+pal_pct <- colorNumeric(palette = c(COLOR_LOW, COLOR_HIGH), domain = prov_map_all$pct)
+
+# =========================
+# Contorno San Martín 
+# =========================
+san_martin_sf <- NULL
+if (has_ne) {
+  library(rnaturalearth)
+  pe_admin1 <- try(ne_states(country = "Peru", returnclass = "sf"), silent = TRUE)
+  if (!inherits(pe_admin1, "try-error")) {
+    san_martin_sf <- pe_admin1 %>%
+      filter(grepl("San ?Mart", name, ignore.case = TRUE) |
+             grepl("San ?Mart", name_en, ignore.case = TRUE))
+    if (nrow(san_martin_sf) > 0) san_martin_sf <- st_transform(san_martin_sf, 4326)
+  }
+}
+
+# Bounds
+lon_min <- min(prov_map_all$LON) - 0.6; lon_max <- max(prov_map_all$LON) + 0.6
+lat_min <- min(prov_map_all$LAT) - 0.6; lat_max <- max(prov_map_all$LAT) + 0.6
+
+# =========================
+# Mapa
+# =========================
+m <- leaflet(options = leafletOptions(zoomControl = TRUE)) %>%
+  addProviderTiles(providers$CartoDB.Positron, group = "Claro") %>%
+  addProviderTiles(providers$CartoDB.DarkMatter, group = "Oscuro")
+
+# Contorno San Martín resaltado
+if (!is.null(san_martin_sf) && nrow(san_martin_sf) > 0) {
+  m <- m %>% addPolygons(
+    data = san_martin_sf,
+    group = "San Martín",
+    fill = TRUE, fillColor = "#ffeda0", fillOpacity = 0.15,  # relleno amarillo claro
+    color = "black", weight = 2, opacity = 1
+  )
+}
+
+# Provincias
+m <- m %>%
+  addCircleMarkers(
+    data = prov_map_all, group = "Provincias",
+    lng = ~LON, lat = ~LAT,
+    radius = ~radius, stroke = TRUE, color = "black", weight = 1,
+    fillOpacity = 0.9, fillColor = ~pal_pct(pct),
+    popup = ~etiqueta, label = ~PROVINCIA
+  ) %>%
+  addLegend(
+    position = "bottomright", pal = pal_pct, values = prov_map_all$pct,
+    title = "% de fallecidos en San Martín", opacity = 0.9,
+    labFormat = labelFormat(suffix = "%", digits = 0)
+  ) %>%
+  addLayersControl(
+    baseGroups = c("Claro", "Oscuro"),
+    overlayGroups = c("San Martín", "Provincias"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE)) %>%
+  fitBounds(lng1 = lon_min, lat1 = lat_min, lng2 = lon_max, lat2 = lat_max)
+
+m
+
+
+```
+
