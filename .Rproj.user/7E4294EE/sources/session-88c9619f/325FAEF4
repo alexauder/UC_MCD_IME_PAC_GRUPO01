@@ -3,7 +3,7 @@
     "path": "~/Profesional/Maestria _ Continental/04 - INTRODUCCIÓN A LOS MODELOS ESTADÍSTICOS/Trabajo Integrador/Producto Académico Colaborativo/PAC_GRUPO_01/02_CODIGO/INFORME_MORTALIDAD.Rmd",
     "project_path": "02_CODIGO/INFORME_MORTALIDAD.Rmd",
     "type": "r_markdown",
-    "hash": "0",
+    "hash": "208799194",
     "contents": "",
     "dirty": false,
     "created": 1758427295549.0,
@@ -12,15 +12,15 @@
     "properties": {
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "1027,23",
-        "scrollLine": "1026"
+        "cursorPosition": "1035,18",
+        "scrollLine": "1028"
     },
     "folds": "397|76|436|0|\n",
-    "lastKnownWriteTime": 1758495100,
+    "lastKnownWriteTime": 1758496294,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1758495100329,
+    "last_content_update": 1758496294845,
     "read_only": false,
     "read_only_alternatives": []
 }
